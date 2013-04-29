@@ -163,8 +163,12 @@ is tracked for each KEY separately."
       (init . ,(helm-git-files:init-fun what root update-once))
       (candidates-in-buffer)
       (delayed)
-      (type . file)
-      (display-to-real . helm-git-files:display-to-real))))
+      (keymap . ,helm-generic-files-map)
+      (help-message . helm-generic-file-help-message)
+      (mode-line . helm-generic-file-mode-line-string)
+      (display-to-real . helm-git-files:display-to-real)
+      (action . ,(cdr (helm-get-actions-from-type
+                     helm-source-file-cache))))))
 
 (defun helm-git-files:submodules-by-dot (&optional dotgitmodule)
   (let ((exp "^[[:space:]]*path[[:space:]]*=[[:space:]]*\\(.*\\)[[:space:]]*$")
