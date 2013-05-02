@@ -28,6 +28,11 @@
 (require 'helm-config)
 (require 'sha1 nil t)
 
+(defvar helm-git-files:cached nil)
+(defvar helm-git-files:update-delay 0.1)
+(defvar helm-git-files:update-timer nil)
+(defvar helm-git-files:last-update 0)
+
 (defgroup helm-git-files nil
   "helm for git files."
   :prefix "helm-git-files:" :group 'helm)
@@ -44,7 +49,7 @@
 
 (defconst helm-git-files:update-check-functions
   '((modified . helm-git-files:status-updated-p)
-    (untracked . helm-git-files:status-updated-p)
+    (untracked . helm-git-files:t)
     (all . helm-git-files:head-updated-p)))
 
 (defconst helm-git-files:status-expire 1)
@@ -82,8 +87,13 @@
 (defun helm-git-files:ls (buffer &rest args)
   (apply 'vc-git-command buffer 0 nil "ls-files" args))
 
+(defun helm-git-files:ls-async (buffer callback &rest args)
+  (let ((proc (apply 'vc-git-command buffer 'async nil "ls-files" args)))
+    (set-process-sentinel proc callback)
+    proc))
+
 (defun helm-git-files:status-1 ()
-  (helm-git-files:command-to-string "status" "--porcelain"))
+  (helm-git-files:command-to-string "status" "--porcelain" "-uno"))
 
 (defun helm-git-files:status-hash (&optional root)
   "Get hash value of \"git status\" for ROOT repository.
@@ -110,6 +120,8 @@ they have been updated."
     (unless updated
       (vc-file-setprop root prop t)
       t)))
+
+(defun helm-git-files:t (&rest args) t)
 
 (defun helm-git-files:head-updated-p (root &optional key)
   (let* ((key (or (and key (format "-%s" key)) ""))
@@ -141,17 +153,61 @@ is tracked for each KEY separately."
     (loop for fun in funs
           always (funcall fun root key))))
 
-(defun helm-git-files:init-fun (what &optional root update-once)
-  `(lambda ()
-     (let* ((root (or ,root (helm-git-files:root)))
-            (buffer-name (format " *helm candidates:%s:%s*" root ',what))
-            (buffer (get-buffer-create buffer-name)))
-       (helm-attrset 'default-directory root) ; saved for `display-to-real'
-       (helm-candidate-buffer buffer)
-       (when (helm-git-files:updated-p ',what root ',what ,update-once)
-         (let ((default-directory root)
-               (args (cdr (assq ',what helm-git-files:ls-args))))
-           (apply 'helm-git-files:ls buffer "--full-name" args))))))
+(defun helm-git-files:candidates (what &optional root update-once)
+  (let* ((root (or root
+                   (helm-attr 'default-directory)
+                   (helm-git-files:root)))
+         (buffer-name (format " *helm candidates:%s:%s*" root what))
+         (buffer (get-buffer-create buffer-name)))
+    (helm-attrset 'default-directory root) ; saved for `display-to-real'
+    (when (and (not (member buffer-name helm-git-files:cached))
+               (helm-git-files:updated-p what root what update-once))
+      (let ((default-directory root)
+            (args (cdr (assq what helm-git-files:ls-args)))
+            (callback 'helm-git-files:sentinel))
+        (apply 'helm-git-files:ls-async buffer callback
+               "--full-name" args)
+        (push buffer-name helm-git-files:cached)))
+    (helm-candidate-buffer buffer)
+    (helm-candidates-in-buffer)))
+
+(defun helm-git-files:sentinel (process event)
+  (when (equal event "finished\n")
+    (helm-git-files:throttled-update)))
+
+(defun helm-git-files:update-1 ()
+  (setq helm-git-files:last-update (float-time)
+        helm-git-files:update-timer nil)
+  (when (and (helm-window) (buffer-live-p (get-buffer helm-buffer)))
+    (with-helm-window
+      (with-current-buffer helm-buffer
+        (let ((line (line-number-at-pos)))
+          (helm-update)
+          (goto-char (point-min))
+          (forward-line (1- line))
+          (helm-skip-noncandidate-line 'next)
+          (helm-mark-current-line)
+          (helm-display-mode-line (helm-get-current-source)))))))
+
+(defun helm-git-files:throttled-update ()
+  (if (<= (- (float-time) helm-git-files:last-update)
+          helm-git-files:update-delay)
+      (unless helm-git-files:update-timer
+        (setq helm-git-files:update-timer
+              (run-at-time helm-git-files:update-delay nil
+                           'helm-git-files:update-1)))
+    (when helm-git-files:update-timer
+      (cancel-timer helm-git-files:update-timer))
+    (helm-git-files:update-1)))
+
+(defun helm-git-files:init ()
+  (helm-attrset 'default-directory (helm-git-files:root)))
+
+(defun helm-git-files:cleanup ()
+  (setq helm-git-files:cached nil))
+
+(defun helm-git-files:candidates-fun (what &optional root update-once)
+  `(lambda () (helm-git-files:candidates ',what ,root ,update-once)))
 
 (defun helm-git-files:display-to-real (name)
   (expand-file-name name (helm-attr 'default-directory)))
@@ -160,15 +216,18 @@ is tracked for each KEY separately."
   (let ((name (concat (format "Git %s" (capitalize (format "%s" what)))
                       (or (and repository (format " in %s" repository)) ""))))
     `((name . ,name)
-      (init . ,(helm-git-files:init-fun what root update-once))
-      (candidates-in-buffer)
+      (init . helm-git-files:init)
+      (cleanup . helm-git-files:cleanup)
+      (candidates . ,(helm-git-files:candidates-fun what root update-once))
       (delayed)
+      (volatile)
+      (match identity)
       (keymap . ,helm-generic-files-map)
       (help-message . helm-generic-file-help-message)
       (mode-line . helm-generic-file-mode-line-string)
-      (display-to-real . helm-git-files:display-to-real)
       (action . ,(cdr (helm-get-actions-from-type
-                     helm-source-file-cache))))))
+                     helm-source-file-cache)))
+      (display-to-real . helm-git-files:display-to-real))))
 
 (defun helm-git-files:submodules-by-dot (&optional dotgitmodule)
   (let ((exp "^[[:space:]]*path[[:space:]]*=[[:space:]]*\\(.*\\)[[:space:]]*$")
@@ -199,7 +258,7 @@ is tracked for each KEY separately."
 
 ;;;###autoload
 (defun helm-git-files:git-p (&optional root)
-  (ignore-errors (helm-git-files:status-hash root)))
+  (ignore-errors (helm-git-files:head root)))
 
 ;;;###autoload
 (defvar helm-git-files:modified-source nil)
