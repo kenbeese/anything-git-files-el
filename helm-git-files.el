@@ -26,6 +26,7 @@
 (eval-when-compile (require 'cl))
 (require 'vc-git)
 (require 'helm-config)
+(require 'helm-files)
 (require 'sha1 nil t)
 
 (defvar helm-git-files:cached nil)
@@ -169,7 +170,7 @@ is tracked for each KEY separately."
                "--full-name" args)
         (push buffer-name helm-git-files:cached)))
     (helm-candidate-buffer buffer)
-    (helm-candidates-in-buffer)))
+    (helm-candidates-in-buffer (helm-get-current-source))))
 
 (defun helm-git-files:sentinel (process event)
   (when (equal event "finished\n")
